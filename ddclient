@@ -678,6 +678,14 @@ my %services = (
             $variables{'service-common-defaults'},
         ),
     },
+    'inwx' => {
+        'updateable' => undef,
+        'update'     => \&nic_inwx_update,
+        'examples'   => \&nic_inwx_examples,
+        'variables'  => merge(
+            $variables{'service-common-defaults'},
+        ),
+    },
 );
 $variables{'merged'} = merge(
     $variables{'global-defaults'},
@@ -4772,6 +4780,135 @@ sub nic_he_update {
                         failed("updating %s: unexpected status (%s)", $host, $line);
                     }
                 }
+            }
+        }
+    }
+}
+
+######################################################################
+## nic_inwx_examples
+######################################################################
+sub nic_inwx_examples {
+    return <<EoEXAMPLE;
+o 'inwx'
+
+The 'inwx' protocol is the protocol used by the free dynamic
+DNS service offered by InterNetworkX at https://www.inwx.de
+
+Configuration variables applicable to the 'inwx' protocol are:
+  protocol=inwx                  ##
+  login=fully.qualified.host   ## the fully qualified hostname
+  password=passowrd   ## the password provided by the admin interface
+  fully.qualified.host         ## the fully qualified hostname
+
+Example ${program}.conf file entries:
+  ## single host update
+  protocol=he,                                      \\
+  login=fully.qualified.host,                       \\
+  password=my-genereated-key                        \\
+  fully.qualified.host
+EoEXAMPLE
+}
+######################################################################
+## nic_inwx_update
+######################################################################
+sub nic_inwx_update {
+    debug("\nnic_noip_update -------------------");
+
+    ## group hosts with identical attributes together
+    my %groups = group_hosts_by([@_], [qw(login password)]);
+
+    my %errors = (
+        'badauth'  => 'Invalid username or password',
+        'badagent' => 'Invalid user agent',
+        'nohost'   => 'The hostname specified does not exist in the database',
+        '!donator' => 'The offline setting was set, when the user is not a donator',
+        'abuse',   => 'The hostname specified is blocked for abuse; open a trouble ticket at http://www.inwx.de',
+        'numhost'  => 'System error: Too many or too few hosts found. open a trouble ticket at http://www.inwx.de',
+        'dnserr'   => 'System error: DNS error encountered. Contact support@dyndns.org',
+        'nochg'    => 'No update required; unnecessary attempts to change to the current address are considered abusive',
+    );
+
+    ## update each set of hosts that had similar configurations
+    foreach my $sig (keys %groups) {
+        my @hosts = @{$groups{$sig}};
+        my $hosts = join(',', @hosts);
+        my $h     = $hosts[0];
+        my $ip    = $config{$h}{'wantip'};
+        my $ipv6  = $config{$h}{'wantipv6'};
+        
+        delete $config{$_}{'wantip'} foreach @hosts;
+        delete $config{$_}{'wantipv6'} foreach @hosts;        
+
+        info("setting IP address to %s for %s", $ip, $hosts);
+        verbose("UPDATE:", "updating %s", $hosts);
+
+        my $url = "https://dyndns.inwx.com/nic/update";
+        $url .= "?hostname=$hosts";
+        $url .= "&myip=";
+        $url .= $ip if $ip;
+        
+        if (defined ($ipv6)) {
+        	$url .= "&myipv6=";
+        	$url .= $ipv6;
+        }
+	
+
+        my $reply = geturl(opt('proxy'), $url, $config{$h}{'login'}, $config{$h}{'password'});
+        if (!defined($reply) || !$reply) {
+            failed("updating %s: Could not connect to dyndns.inwx.com", $hosts);
+            last;
+        }
+
+        my @reply = split /\n/, $reply;
+        my $returnedip = $ip;
+
+        foreach my $line (@reply) {
+
+            # bug #10: some dyndns providers does not return the IP so
+            # we can't use the returned IP
+            my ($status, $returnedip) = split / /, lc $line;
+            $ip = $returnedip if (not $ip);
+            my $h = shift @hosts;
+
+            $config{$h}{'status'} = $status;
+            
+            if ($status eq 'good') {
+                $config{$h}{'ip'}    = $ip;
+                $config{$h}{'mtime'} = $now;
+                success("updating %s: %s: IP address set to %s", $h, $status, $ip);
+                
+                if (defined ($ipv6)) {
+                        success("updating %s: %s: IPv6 address set to %s", $h, $status, $ipv6);
+                        $config{$h}{'ipv6'}     = $ipv6;
+                        $config{$h}{'status-ipv6'} = 'good';
+                }
+
+            } elsif (exists $errors{$status}) {
+                if ($status eq 'nochg') {
+                    warning("updating %s: %s: %s", $h, $status, $errors{$status});
+                    $config{$h}{'ip'}     = $ip;
+                    $config{$h}{'mtime'}  = $now;
+                    $config{$h}{'status'} = 'good';
+
+                } else {
+                    failed("updating %s: %s: %s", $h, $status, $errors{$status});
+                }
+
+            } elsif ($status =~ /w(\d+)(.)/) {
+                my ($wait, $units) = ($1,    lc $2);
+                my ($sec,  $scale) = ($wait, 1);
+
+                ($scale, $units) = (1,  'seconds') if $units eq 's';
+                ($scale, $units) = (60, 'minutes') if $units eq 'm';
+                ($scale, $units) = (60 * 60, 'hours') if $units eq 'h';
+
+                $sec = $wait * $scale;
+                $config{$h}{'wtime'} = $now + $sec;
+                warning("updating %s: %s: wait $wait $units before further updates", $h, $status, $ip);
+
+            } else {
+                failed("updating %s: unexpected status (%s)", $h, $line);
             }
         }
     }
